@@ -1,0 +1,326 @@
+```{r setup, include=FALSE}
+library('ggplot2')
+library('tidyverse')
+library("viridis")
+library("dplyr")
+library('caret')
+library('glmnet')
+library('pROC')
+library('matrixStats') # row standard deviation
+library('naniar')
+library('impute')
+library('readxl')
+library('Hmisc')#install.packages('acepack')
+library('shapr')
+library('ComplexHeatmap')
+library('ggnewscale')
+library('GGally')
+library('imputeLCMD')
+library('ggpubr')
+library('scales')
+```
+
+```{r create folder to save plots if they don't exist}
+
+folders <- c("validation_plots", "validation_results")
+# Create folders if they do not exist
+for (folder in folders) {
+  if (!dir.exists(folder)) {
+    dir.create(folder)
+    message(paste("Created folder:", folder))
+  } else {
+    message(paste("Folder already exists:", folder))
+  }
+}
+```
+```{r set directory}
+# if you are using Rstudio run the following command, otherwise, set the working directory to the folder where this script is in
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+```
+
+
+```{r load data}
+  ##Load dataset
+  datasets = list()
+  datasets[[1]] = read_excel("data/240801-WB results VC.xlsx")
+  names(datasets) = c("RD_raw")
+  
+  # Change column names
+  names(datasets[[1]])[names(datasets[[1]]) == "Kriterium"] = "status"
+  names(datasets[[1]])[names(datasets[[1]]) == "Probe"] = "patid"
+  
+  # Change the status type to numeric
+  datasets[[1]]$status = as.factor(datasets[[1]]$status)
+  
+  # Convert protein values into numeric 
+  datasets[[1]][, 3:ncol(datasets[[1]])] = apply(datasets[[1]][, 3:ncol(datasets[[1]])], 2, as.numeric)
+
+```
+
+```{r transform and imputation}
+  # Transform dataset
+  protein_start_col = 3
+  RD_log10 = datasets[["RD_raw"]]
+  RD_log10[, protein_start_col:ncol(RD_log10)] = log10(RD_log10[, protein_start_col:ncol(RD_log10)])
+  RD_log10[RD_log10 == -Inf] <- 0
+  datasets = c(datasets, list(RD_log10))
+  names(datasets)[length(datasets)] = c("RD_log10")
+  
+  # Mindet imputation
+  d = datasets[[2]][, protein_start_col:ncol(datasets[[2]])]
+  set.seed(1234)  
+  imp = impute.MinDet(d, q = 0.01)
+  k = length(datasets) + 1
+  datasets[[k]] = cbind(datasets[[2]][, 1:2], imp)
+  names(datasets)[k] = paste0(names(datasets)[2], "_mindet")
+
+```
+ 
+
+```{r select data for ML}
+  data = datasets$RD_log10_mindet
+  data$status = (as.numeric(data$status)-1)
+  df_ml = data[,!names(data) == "patid"] 
+```
+
+
+```{r lasso regression model with 6 proteins}
+  source('functions.R')
+  lm = runML(df_ml,'lm', BS_number = 500) #build lasso model
+  
+  # save results for later use
+  saveRDS(lm, file = 'validation_results/linearModel.rds')
+  
+  # plot averaged ROC curve
+  ROC_curve = calculateROC(lm, df_ml,'validation_plots/rocc_lm.pdf')
+  
+  # save results for later use
+  write.csv(ROC_curve$plotci, file = 'validation_results/rocc_lm.csv')
+  
+  # extract weights + plot averaged
+  lm_weights = plotWeights(lm,paste0("validation_plots/weights_lm.pdf"))
+  
+  # save results for later use
+  write.csv(lm_weights, file = paste0('validation_results/weights_lm.csv'))
+
+```
+
+```{r other models with 2 proteins}
+  source('data/jennys_functions.R')
+  d_HP <- data[c("HP", "status")]
+  d_SE <- data[c("HP", "status")]
+  d_HS <- data[c("HP", "SERPINC1", "status")]
+  
+  # List to store all dataframes
+  two_protein_lists <- list(d_HP=d_HP, d_SE=d_SE, d_HS=d_HS)
+  bs = 500
+  all_AUC_results <- data.frame(model_name=c('Random_Forest','SVM_Linear','SVM_Radial'))
+  for (name in names(two_protein_lists)){
+    d <- two_protein_lists[[name]]   # Access each dataframe by name
+    d$status = (as.numeric(data$status)-1)
+    rf = runML(d,'rf', BS_number = bs) #
+    svm_l = runML(d,'svm lin', BS_number = bs) 
+    svm_r = runML(d,'svm rad', BS_number = bs) 
+    # save results for later use
+    saveRDS(rf, file = paste0('validation_results/',name,'randomForest.rds'))
+    saveRDS(svm_l, file = paste0('validation_results/',name,'SVMLinear.rds'))
+    saveRDS(svm_r, file = paste0('validation_results/',name,'SVMRadial.rds'))
+    
+    # plot averaged ROC curve
+    ROC_curve_rf = calculateROC(rf, d, paste0('validation_plots/',name,'rocc_rf.pdf'))
+    ROC_curve_svm_l = calculateROC(svm_l, d, paste0('validation_plots/',name,'rocc_svm_l.pdf'))
+    ROC_curve_svm_r = calculateROC(svm_r, d, paste0('validation_plots/',name,'rocc_svm_r.pdf'))
+    
+    all_AUC_results[[name]] = c(ROC_curve_rf$auc, ROC_curve_svm_l$auc, ROC_curve_svm_r$auc)
+    
+    # save results for later use
+    write.csv(ROC_curve_rf$plotci, file = paste0('validation_results/',name,'rocc_rf.csv'))
+    write.csv(ROC_curve_svm_l$plotci, file = paste0('validation_results/',name,'rocc_svm_l.csv'))
+    write.csv(ROC_curve_svm_r$plotci, file = paste0('validation_results/',name,'rocc_svm_r.csv'))
+
+  }
+```
+
+```{r AUCROC for lasso regression}
+
+  # load averaged weights
+  avgweights = read.csv('validation_results/weights_lm.csv', row.names = 1)
+  
+  # filter out proteins that were only picked in 1 run
+  # remove the ones where error > avg & picked once
+  avgweights = avgweights[which(avgweights$picks > 1), ]
+  avgweights = avgweights[which(abs(avgweights$avg)>abs(avgweights$error)), ]
+  avgweights = as.data.frame(avgweights)
+  
+  # bring data in same sample order
+  data = datasets$RD_log10_mindet
+  all_data = data[,!names(data) == "patid"] 
+  row.names(all_data) = all_data$Row.names 
+  all_data$Row.names = NULL
+  
+  # create data.frame with rows corresponding to all available proteins. Where possible average weights of proteins are stored, all others are 0
+  averageweights_m = matrix(nrow=length(names(all_data[ ,!names(all_data) == "status"])), ncol = 1)
+  averageweights_m = as.data.frame(averageweights_m)
+  averageweights_m[is.na(averageweights_m)] = 0
+  rownames(averageweights_m) = names(all_data[ ,!names(all_data) == "status"])
+  for(i in 1:nrow(averageweights_m)){
+    for(j in 1:nrow(avgweights)){
+      if(row.names(averageweights_m)[i] == row.names(avgweights)[j]){
+        averageweights_m[i,"V1"] = avgweights[j, "avg"]
+      }
+    }
+  }
+  
+  #### genes of interest
+  genes = c("HP", "SERPINC1")
+  
+  # Get data frame for plotting with auc for different combinations
+  # arguments:    vectornames: character vector of genes of interest
+  #               weight_data: data frame as explained above (averageweights_m)
+  #               protein_data: data to calculate the auc on (needs protein columns and status column)
+  #               maxn: maximal length of combinations (default = length of vectornames)
+  #               add: boolean value if combinations should be built, or just cummulative addition of the genes in vectornames
+  # returns: data frame with combinations and auc column
+  curvy = auccurve(genes, averageweights_m, all_data)
+  
+  # select colours for bar plot
+  farbe = c("#D17480","#C95D6B", "#C14655", "#BA2F40", "#B2182B", "#A01627",	"#8E1322", "#7D111E","#6B0E1A")
+  
+  # plot overall best combinations
+  # number of combinations to plot
+  n = 9
+  ggplot(curvy[c(1:n), ], aes(x = reorder(paste0(combinations),auc), y = auc, fill = reorder(paste0(combinations),auc))) + geom_bar(stat = "identity") +
+    ylab("AUC")  +theme(legend.position = "none", axis.text.x = element_text(face = 'bold', size = 11)) +
+    scale_fill_manual(values = farbe) +
+    xlab("Genes") + scale_y_continuous(breaks = c(0,0.2,0.4,seq(0.5,0.7,0.05)),limits = c(0,0.7))+
+    ggtitle("AUC of single protein models")
+  # save AUC bar  plot
+  ggsave("validation_plots/AUCbar.pdf", width = 11, height = 8, units = "in")
+  
+  #plot of cumulative
+  curvy_add = auccurve(genes, averageweights_m,all_data, add = TRUE)
+  
+  ggplot(curvy_add, aes(x = paste0(combinations), y = auc,group = 1)) + geom_line() +
+    theme(axis.text.x = element_text(face = 'bold', size = 11))+
+    scale_x_discrete(labels = wrap_format(10))+
+    ylab("AUC") +
+    xlab("Genes") + 
+    ggtitle("AUC of models")
+  # save adding proteins plot
+  ggsave("validation_plots/AUCadd.pdf", width = 11, height = 8, units = "in")
+  
+```
+
+```{r Add AUCROC for other models}
+  # Change the shape
+  other_model_AUC = as.data.frame(t(all_AUC_results))
+  colnames(other_model_AUC) = other_model_AUC[1, ]
+  other_model_AUC = other_model_AUC[-1, ]
+  
+  other_model_AUC$combinations = c('HP', 'SERPINC1', 'HP, SERPINC1')
+  curvy_2 = curvy
+  curvy_2$combinations <- unlist(curvy_2$combinations)
+  colnames(curvy_2)[2] = "LM"
+  full_AUC_scores = merge(curvy_2, other_model_AUC, by = "combinations", all = FALSE)
+  rownames(full_AUC_scores) = full_AUC_scores$combinations
+  full_AUC_scores$combinations <- NULL
+  full_AUC_scores[] <- data.frame(lapply(full_AUC_scores, as.numeric))
+  full_AUC_scores <- full_AUC_scores[order(full_AUC_scores$LM), ]
+  
+  # PLotting
+  # Convert row names to x-axis labels
+  pdf("validation_plots/model_diff_AUC.pdf", width = 8, height = 6)  # Width and height in inches
+  
+  # Adjust margins to make space for the legend
+  par(mar = c(5, 4, 4, 8))  # Increase the right margin
+  x_labels <- rownames(full_AUC_scores)
+  
+  # Create the line plot
+  matplot(full_AUC_scores, type = "l", lty = 1, pch = 1, xlab = "Genes", ylab = "Values", xaxt = "n", col = 1:ncol(full_AUC_scores), lwd = 2)
+  
+  # Add x-axis labels
+  axis(1, at = 1:nrow(full_AUC_scores), labels = x_labels)
+  
+  # Add legend to the bottom-right corner
+  legend("topleft", legend = colnames(full_AUC_scores), col = 1:ncol(full_AUC_scores), 
+         lty = 1, pch = 1, title = "Methods", lwd = 2, 
+         xpd = TRUE, cex=0.7) # Adjust inset for positioning
+  dev.off()
+```
+
+```{r box plot functions for proteins}
+
+# plots box plot for each proteins and their p values based on two status groups
+# statistics of the proteins are also outputted for additional data
+plot_box_with_pvalues <- function(data, status_col = "status", dataname, foldernum) {
+  # Convert the status column to a factor if it isn't already
+  data[[status_col]] <- as.factor(data[[status_col]])
+  
+  # Get columns to plot (excluding status column)
+  columns_to_plot <- setdiff(names(data), status_col)
+  
+  # Calculate and print mean and standard deviation for each group
+  group_stats <- data %>%
+    group_by(across(all_of(status_col))) %>%
+    summarise(across(where(is.numeric), 
+                     list(mean = ~mean(.x, na.rm = TRUE), 
+                          sd = ~sd(.x, na.rm = TRUE)), 
+                     .names = "{.col}_{.fn}")) %>%
+    ungroup()
+  print(group_stats)
+  
+  # Create an empty list to store plots
+  plot_list <- list()
+  # Loop through each column to plot
+  for (col_name in columns_to_plot) {
+    # Perform a statistical test (e.g., t-test for two groups, ANOVA for multiple groups)
+    # Adjust p-values using Bonferroni correction
+    pval <- if (length(levels(data[[status_col]])) == 2) {
+      t.test(as.formula(paste(col_name, "~", status_col)), data = data)$p.value
+    } else {
+      anova(lm(as.formula(paste(col_name, "~", status_col)), data = data))$`Pr(>F)`[1]
+    }
+    adj_pval <- p.adjust(pval, method = "bonferroni")
+    print(adj_pval)
+    
+    # Create box plot with jitter using ggplot2 and display the adjusted p-value
+    p <- ggplot(data, aes_string(x = status_col, y = col_name, fill = status_col)) +
+      geom_boxplot(outlier.shape = NA, alpha = 0.7) +  # Remove outliers from box plot to avoid overlap
+      geom_jitter(width = 0.2, size = 1, alpha = 0.5) + # Add jitter plot for individual points
+      theme_minimal() +
+      labs(title = col_name, y = col_name, x = status_col) +
+      theme(legend.position = "none") +
+      annotate("text", 
+           x = 1.5, 
+           y = max(data[[col_name]], na.rm = TRUE) - 0.1 * diff(range(data[[col_name]], na.rm = TRUE)), 
+           label = paste("Adj p-val:", signif(adj_pval, 3)),
+           size = 3, color = "black", vjust = -0.5)
+    
+    # Add plot to the list
+    plot_list[[col_name]] <- p
+  }
+  
+  # Combine all plots into a single figure
+  combined_plot <- ggarrange(plotlist = plot_list, ncol = min(3, length(plot_list)), nrow = ceiling(length(plot_list) / 3))
+  print(combined_plot)
+  if (is.null(folder_num)){
+    ggsave(paste0('validation_plots/run', foldernum,'/boxplot_with_adj_p_',dataname,'.pdf'), combined_plot, width = 10, height = 8)
+  }else{
+    ggsave(paste0('validation_plots/boxplot_with_adj_p_',dataname,'.pdf'), combined_plot, width = 10, height = 8)
+  }
+  #summary data
+  base_summary <- summary(data)
+  sd_values <- sapply(data, function(x) if (is.numeric(x)) sd(x) else NA)
+  summary_with_sd <- rbind(base_summary, SD = sd_values)
+  print(summary_with_sd)
+  return(summary_with_sd)
+}
+```
+
+```{r box plots for proteins}
+data_num = 3
+d = datasets[[data_num]]
+d = d[,!names(d) == "patid"]
+summary_with_sd = plot_box_with_pvalues(d, dataname = names(datasets)[data_num])
+
+```
